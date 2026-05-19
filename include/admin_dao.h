@@ -142,6 +142,7 @@ public:
 
     int publishPolicy(const std::string& app_code, const std::string& published_by, const std::string& publish_note);
 
+    bool setPolicyVersion(const std::string& app_code, int policy_version, const std::string& published_by, const std::string& publish_note);
 
     bool insertAuditLog(const AuditLogRecord& record);
 

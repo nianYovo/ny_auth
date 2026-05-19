@@ -84,6 +84,25 @@ void TestInvalidateOperations() {
     Expect(stats.invalidate_count == 3, "invalidate_count includes key, prefix, and clear removals");
 }
 
+void TestMaxEntriesEviction() {
+    LocalCache<int> cache(2);
+
+    cache.Put("first", 1, 5);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    cache.Put("second", 2, 5);
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    cache.Put("third", 3, 5);
+
+    int value = 0;
+    Expect(cache.Size() == 2, "cache respects max_entries after Put");
+    Expect(!cache.Get("first", value), "oldest entry is evicted when max_entries is exceeded");
+    Expect(cache.Get("second", value), "newer entry remains after eviction");
+    Expect(cache.Get("third", value), "latest entry remains after eviction");
+
+    const auto stats = cache.GetStats();
+    Expect(stats.eviction_count == 1, "eviction_count increments when max_entries evicts");
+}
+
 }  // namespace
 
 int main() {
@@ -91,6 +110,7 @@ int main() {
     TestPutAndGet();
     TestMissAndExpiration();
     TestInvalidateOperations();
+    TestMaxEntriesEviction();
 
     if (failures > 0) {
         std::cerr << failures << " test assertion(s) failed.\n";

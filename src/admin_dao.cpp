@@ -813,6 +813,68 @@ int AdminDAO::publishPolicy(const std::string& app_code, const std::string& publ
 }
 
 // ======================================================
+// setPolicyVersion
+// 作用：把策略版本恢复或设置到指定版本
+// 用途：
+// - 发布策略后快照构建失败时，回滚刚递增的版本号
+// - 管理修复工具显式设置版本
+// ======================================================
+bool AdminDAO::setPolicyVersion(const std::string& app_code,
+                                int policy_version,
+                                const std::string& published_by,
+                                const std::string& publish_note) {
+    if (policy_version <= 0) {
+        setLastError("policy_version must be positive");
+        return false;
+    }
+
+    try {
+        std::unique_ptr<sql::Connection> conn(createConnection());
+
+        std::unique_ptr<sql::PreparedStatement> app_stmt(
+            conn->prepareStatement(
+                "SELECT id FROM ny_apps WHERE app_code = ? LIMIT 1"
+            )
+        );
+
+        app_stmt->setString(1, app_code);
+
+        std::unique_ptr<sql::ResultSet> app_rs(app_stmt->executeQuery());
+        if (!app_rs->next()) {
+            return false;
+        }
+
+        const int64_t app_id = app_rs->getInt64("id");
+
+        std::unique_ptr<sql::PreparedStatement> stmt(
+            conn->prepareStatement(
+                "INSERT INTO ny_policy_versions ("
+                "  app_id, current_version, published_by, publish_note "
+                ") VALUES (?, ?, ?, ?) "
+                "ON DUPLICATE KEY UPDATE "
+                "  current_version = VALUES(current_version), "
+                "  published_by = VALUES(published_by), "
+                "  publish_note = VALUES(publish_note), "
+                "  updated_at = CURRENT_TIMESTAMP"
+            )
+        );
+
+        stmt->setInt64(1, app_id);
+        stmt->setInt(2, policy_version);
+        stmt->setString(3, published_by);
+        stmt->setString(4, publish_note);
+
+        return stmt->executeUpdate() > 0;
+    } catch (const sql::SQLException& e) {
+        setLastError(e.what());
+        return false;
+    } catch (const std::exception& e) {
+        setLastError(e.what());
+        return false;
+    }
+}
+
+// ======================================================
 // insertAuditLog
 // 作用：插入一条审计日志
 // ======================================================

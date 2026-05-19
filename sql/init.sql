@@ -594,6 +594,7 @@ VALUES
 -- 默认账号：
 --   username = admin
 --   password = admin123
+--   password_hash = pbkdf2_sha256$iterations$salt$hash
 -- =========================================================
 INSERT INTO ny_console_users (
     username,
@@ -604,7 +605,7 @@ INSERT INTO ny_console_users (
 )
 VALUES (
     'admin',
-    'admin123',
+    'pbkdf2_sha256$120000$ny_auth_dev_salt_v1$46f774dced687d5268dae337c26e619f9948d910a5098a2fab3bc73794b4c1b2',
     '系统管理员',
     1,
     1

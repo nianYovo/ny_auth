@@ -26,6 +26,8 @@ public:
         T value;
 
         Clock::time_point expire_at;
+
+        Clock::time_point inserted_at;
     };
 
     struct CacheStats {
@@ -37,7 +39,17 @@ public:
         std::size_t put_count = 0;
 
         std::size_t invalidate_count = 0;
+
+        std::size_t eviction_count = 0;
     };
+
+    explicit LocalCache(std::size_t max_entries = 0) : max_entries_(max_entries) {}
+
+    void SetMaxEntries(std::size_t max_entries) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        max_entries_ = max_entries;
+        evictIfNeededLocked(Clock::now());
+    }
 
     void Put(const std::string& key,const T& value, int ttl_seconds) {
 
@@ -45,9 +57,11 @@ public:
 
         const auto now = Clock::now();
 
-        cache_[key] = Entry{value, now + std::chrono::seconds(ttl_seconds)};
+        cache_[key] = Entry{value, now + std::chrono::seconds(ttl_seconds), now};
 
         ++stats_.put_count;
+
+        evictIfNeededLocked(now);
     }
 
     bool Get(const std::string& key,T& value) {
@@ -148,9 +162,50 @@ public:
 
 private:
 
+    void evictIfNeededLocked(Clock::time_point now) {
+        if (cache_.empty()) {
+            return;
+        }
+
+        for (auto it = cache_.begin(); it != cache_.end();) {
+            if (now > it->second.expire_at) {
+                it = cache_.erase(it);
+                ++stats_.invalidate_count;
+            } else {
+                ++it;
+            }
+        }
+
+        if (max_entries_ == 0) {
+            return;
+        }
+
+        while (cache_.size() > max_entries_) {
+            auto oldest_it = cache_.end();
+            auto oldest_time = Clock::time_point::max();
+
+            for (auto it = cache_.begin(); it != cache_.end(); ++it) {
+                if (it->second.inserted_at < oldest_time) {
+                    oldest_time = it->second.inserted_at;
+                    oldest_it = it;
+                }
+            }
+
+            if (oldest_it == cache_.end()) {
+                return;
+            }
+
+            cache_.erase(oldest_it);
+            ++stats_.eviction_count;
+            ++stats_.invalidate_count;
+        }
+    }
+
     std::unordered_map<std::string, Entry> cache_;
 
     CacheStats stats_;
+
+    std::size_t max_entries_ = 0;
 
     mutable std::mutex mutex_;
 };

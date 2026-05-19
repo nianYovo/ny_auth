@@ -80,8 +80,14 @@ DEFINE_string(db_name, "ny_auth", "MySQL database name");
 // 运行时权限缓存 TTL（秒）
 DEFINE_int32(cache_ttl, 60, "runtime permission cache ttl in seconds");
 
+// 运行时权限缓存最大条目数，0 表示不限制
+DEFINE_uint64(cache_max_entries, 100000, "runtime permission cache max entries, 0 means unlimited");
+
 // 管理员登录 session TTL（秒）
 DEFINE_int32(admin_session_ttl, 3600, "admin session ttl in seconds");
+
+// 管理员 session 缓存最大条目数，0 表示不限制
+DEFINE_uint64(admin_session_cache_max_entries, 10000, "admin session cache max entries, 0 means unlimited");
 
 // 是否在启动时自动加载某个 app 的最新快照
 // 为空表示不自动加载
@@ -112,13 +118,17 @@ int main(int argc, char* argv[]) {
     // 1) 创建运行时权限缓存
     // ==================================================
     auto runtime_permission_cache =
-        std::make_shared<LocalCache<UserPermSet>>();
+        std::make_shared<LocalCache<UserPermSet>>(
+            static_cast<std::size_t>(FLAGS_cache_max_entries)
+        );
 
     // ==================================================
     // 2) 创建管理员 session 缓存
     // ==================================================
     auto admin_session_cache =
-        std::make_shared<AdminSessionCache>();
+        std::make_shared<AdminSessionCache>(
+            static_cast<std::size_t>(FLAGS_admin_session_cache_max_entries)
+        );
 
     // ==================================================
     // 3) 创建运行时 DAO
@@ -328,7 +338,9 @@ int main(int argc, char* argv[]) {
               << ", db_port=" << FLAGS_db_port
               << ", db_name=" << FLAGS_db_name
               << ", runtime_cache_ttl=" << FLAGS_cache_ttl
+              << ", runtime_cache_max_entries=" << FLAGS_cache_max_entries
               << ", admin_session_ttl=" << FLAGS_admin_session_ttl
+              << ", admin_session_cache_max_entries=" << FLAGS_admin_session_cache_max_entries
               << ", agent_bootstrap_app_code=" << FLAGS_agent_bootstrap_app_code
               << ", local_snapshot_loaded=" << (local_snapshot_engine->HasSnapshot() ? "true" : "false")
               << ", services=[AuthService, AdminService, AgentService]";

@@ -1,6 +1,7 @@
 #include "snapshot_dao.h"
 
 #include <cctype>
+#include <iomanip>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -9,11 +10,8 @@
 namespace {
 
 // ======================================================
-// 下面这些辅助函数，都是给“最小可用 JSON 序列化 / 反序列化”服务的
-// 说明：
-// 1. 当前实现不引入第三方 JSON 库
-// 2. 我们先自己实现一个够当前项目使用的最小版本
-// 3. 这个版本重点是“先把快照链路跑通”
+// 下面这些辅助函数服务于快照 JSON 序列化 / 反序列化。
+// 当前实现覆盖项目快照结构所需的 JSON 子集，并处理基础转义。
 // ======================================================
 
 // ------------------------------------------------------
@@ -68,7 +66,7 @@ void SkipWhitespace(const std::string& text, std::size_t& pos) {
 std::string EscapeJsonString(const std::string& input) {
     std::ostringstream oss;
 
-    for (char ch : input) {
+    for (unsigned char ch : input) {
         switch (ch) {
             case '\"':
                 oss << "\\\"";
@@ -92,7 +90,14 @@ std::string EscapeJsonString(const std::string& input) {
                 oss << "\\t";
                 break;
             default:
-                oss << ch;
+                if (ch < 0x20) {
+                    oss << "\\u"
+                        << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(ch)
+                        << std::dec << std::setfill(' ');
+                } else {
+                    oss << static_cast<char>(ch);
+                }
                 break;
         }
     }
@@ -155,6 +160,33 @@ std::string ParseJsonString(const std::string& text, std::size_t& pos) {
                 case 't':
                     oss << '\t';
                     break;
+                case 'u': {
+                    if (pos + 4 > text.size()) {
+                        throw std::runtime_error("invalid unicode escape in json string");
+                    }
+
+                    int code = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        const char hex = text[pos++];
+                        code <<= 4;
+                        if (hex >= '0' && hex <= '9') {
+                            code += hex - '0';
+                        } else if (hex >= 'a' && hex <= 'f') {
+                            code += 10 + hex - 'a';
+                        } else if (hex >= 'A' && hex <= 'F') {
+                            code += 10 + hex - 'A';
+                        } else {
+                            throw std::runtime_error("invalid unicode escape in json string");
+                        }
+                    }
+
+                    if (code <= 0x7F) {
+                        oss << static_cast<char>(code);
+                    } else {
+                        throw std::runtime_error("non-ascii unicode escape is not supported");
+                    }
+                    break;
+                }
                 default:
                     throw std::runtime_error("unsupported escape in json string");
             }

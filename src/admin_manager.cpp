@@ -1,9 +1,107 @@
 #include "admin_manager.h"
 
 #include <chrono>
+#include <iomanip>
 #include <random>
 #include <sstream>
 #include <utility>
+
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <openssl/sha.h>
+
+namespace {
+
+std::string BytesToHex(const unsigned char* data, std::size_t size) {
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (std::size_t i = 0; i < size; ++i) {
+        oss << std::setw(2) << static_cast<int>(data[i]);
+    }
+    return oss.str();
+}
+
+std::string Sha256Hex(const std::string& input) {
+    unsigned char digest[SHA256_DIGEST_LENGTH] = {0};
+    SHA256(reinterpret_cast<const unsigned char*>(input.data()), input.size(), digest);
+    return BytesToHex(digest, SHA256_DIGEST_LENGTH);
+}
+
+bool ConstantTimeEquals(const std::string& left, const std::string& right) {
+    if (left.size() != right.size()) {
+        return false;
+    }
+
+    unsigned char diff = 0;
+    for (std::size_t i = 0; i < left.size(); ++i) {
+        diff |= static_cast<unsigned char>(left[i] ^ right[i]);
+    }
+    return diff == 0;
+}
+
+bool VerifyPassword(const std::string& password, const std::string& stored_hash) {
+    const std::string pbkdf2_prefix = "pbkdf2_sha256$";
+    if (stored_hash.compare(0, pbkdf2_prefix.size(), pbkdf2_prefix) == 0) {
+        const std::size_t iter_start = pbkdf2_prefix.size();
+        const std::size_t salt_sep = stored_hash.find('$', iter_start);
+        if (salt_sep == std::string::npos || salt_sep + 1 >= stored_hash.size()) {
+            return false;
+        }
+
+        const std::size_t hash_sep = stored_hash.find('$', salt_sep + 1);
+        if (hash_sep == std::string::npos || hash_sep + 1 >= stored_hash.size()) {
+            return false;
+        }
+
+        int iterations = 0;
+        try {
+            iterations = std::stoi(stored_hash.substr(iter_start, salt_sep - iter_start));
+        } catch (...) {
+            return false;
+        }
+
+        if (iterations < 10000) {
+            return false;
+        }
+
+        const std::string salt = stored_hash.substr(salt_sep + 1, hash_sep - salt_sep - 1);
+        const std::string expected_hash = stored_hash.substr(hash_sep + 1);
+
+        unsigned char derived[32] = {0};
+        if (PKCS5_PBKDF2_HMAC(
+                password.c_str(),
+                static_cast<int>(password.size()),
+                reinterpret_cast<const unsigned char*>(salt.data()),
+                static_cast<int>(salt.size()),
+                iterations,
+                EVP_sha256(),
+                sizeof(derived),
+                derived) != 1) {
+            return false;
+        }
+
+        return ConstantTimeEquals(BytesToHex(derived, sizeof(derived)), expected_hash);
+    }
+
+    const std::string prefix = "sha256$";
+    if (stored_hash.compare(0, prefix.size(), prefix) == 0) {
+        const std::size_t salt_start = prefix.size();
+        const std::size_t hash_sep = stored_hash.find('$', salt_start);
+        if (hash_sep == std::string::npos || hash_sep + 1 >= stored_hash.size()) {
+            return false;
+        }
+
+        const std::string salt = stored_hash.substr(salt_start, hash_sep - salt_start);
+        const std::string expected_hash = stored_hash.substr(hash_sep + 1);
+        const std::string actual_hash = Sha256Hex(salt + password);
+        return ConstantTimeEquals(actual_hash, expected_hash);
+    }
+
+    // Backward compatibility for old local databases initialized with plaintext.
+    return ConstantTimeEquals(password, stored_hash);
+}
+
+}  // namespace
 
 // ======================================================
 // 构造函数
@@ -21,7 +119,7 @@ AdminManager::AdminManager(std::shared_ptr<AdminDAO> admin_dao, std::shared_ptr<
 // 1. 校验用户名/密码非空
 // 2. 查管理员账号
 // 3. 检查账号状态
-// 4. 先做“简单密码比对”
+// 4. 校验密码哈希
 // 5. 生成 token
 // 6. 写入 session cache
 // 7. 更新最近登录时间
@@ -79,7 +177,7 @@ ManagerLoginResult AdminManager::Login(const ManagerLoginRequest& request) {
         return result;
     }
 
-    if(request.password != console_user.password_hash) {
+    if(!VerifyPassword(request.password, console_user.password_hash)) {
 
         result.status.success = false;
         result.status.message = "用户名或密码错误";
@@ -633,11 +731,19 @@ ManagerPublishPolicyResult AdminManager::PublishPolicy(const ManagerPublishPolic
             );
 
         if(!snapshot_result.status.success) {
+            const bool rollback_ok = admin_dao_->setPolicyVersion(
+                request.app_code,
+                old_version,
+                operator_identity.username,
+                "rollback after snapshot failure: " + request.publish_note
+            );
 
             result.status.success = false;
-            result.status.message = "发布策略版本成功，但构建快照失败：" + snapshot_result.status.message;
+            result.status.message = rollback_ok
+                ? "构建快照失败，策略版本已回滚：" + snapshot_result.status.message
+                : "构建快照失败，且策略版本回滚失败：" + snapshot_result.status.message;
             result.status.error_code = snapshot_result.status.error_code.empty() ? "INTERNAL_ERROR" : snapshot_result.status.error_code;
-            result.new_policy_version = new_version;
+            result.new_policy_version = rollback_ok ? old_version : new_version;
 
             std::ostringstream before_text;
             before_text << "policy_version = " << old_version;
@@ -645,7 +751,8 @@ ManagerPublishPolicyResult AdminManager::PublishPolicy(const ManagerPublishPolic
             std::ostringstream after_text;
             after_text << "policy_version = " << new_version
                        << ", publish_note = " << request.publish_note
-                       << ", snapshot_error = " << snapshot_result.status.message;
+                       << ", snapshot_error = " << snapshot_result.status.message
+                       << ", rollback_ok = " << (rollback_ok ? 1 : 0);
 
             writeAuditLog(operator_identity, request.app_code, "PUBLISH_POLICY_SNAPSHOT_FAILED", "policy", request.app_code, before_text.str(), after_text.str(), "published policy version but failed to build snapshot");
 
@@ -857,16 +964,17 @@ bool AdminManager::authorizeOperator(const OperatorIdentity& operator_identity) 
 // ======================================================
 std::string AdminManager::generateToken(const ConsoleUserInfo& console_user) const {
 
-    const int64_t now_seconds = nowUnixSeconds();
+    (void)console_user;
 
-    std::random_device rd;
-    std::mt19937_64 gen(rd());
-    std::uniform_int_distribution<unsigned long long> dist(100000ULL, 999999ULL);
+    unsigned char bytes[32] = {0};
+    if (RAND_bytes(bytes, sizeof(bytes)) != 1) {
+        std::random_device rd;
+        for (unsigned char& byte : bytes) {
+            byte = static_cast<unsigned char>(rd() & 0xFF);
+        }
+    }
 
-    std::ostringstream oss;
-    oss << console_user.username << "_" << console_user.id << "_" << now_seconds << "_" << dist(gen);
-
-    return oss.str();
+    return BytesToHex(bytes, sizeof(bytes));
 }
 
 // ======================================================

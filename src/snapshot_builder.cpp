@@ -2,6 +2,7 @@
 
 #include <chrono>
 #include <ctime>
+#include <iomanip>
 #include <memory>
 #include <sstream>
 #include <utility>
@@ -35,7 +36,7 @@ std::string BuildCurrentDateTimeString() {
 std::string EscapeJsonString(const std::string& input) {
     std::ostringstream oss;
 
-    for (char ch : input) {
+    for (unsigned char ch : input) {
         switch (ch) {
             case '\"':
                 oss << "\\\"";
@@ -59,7 +60,14 @@ std::string EscapeJsonString(const std::string& input) {
                 oss << "\\t";
                 break;
             default:
-                oss << ch;
+                if (ch < 0x20) {
+                    oss << "\\u"
+                        << std::hex << std::setw(4) << std::setfill('0')
+                        << static_cast<int>(ch)
+                        << std::dec << std::setfill(' ');
+                } else {
+                    oss << static_cast<char>(ch);
+                }
                 break;
         }
     }
