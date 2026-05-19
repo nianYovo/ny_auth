@@ -237,6 +237,17 @@ std::string ExtractErrorMessage(const std::string& error_text) {
     return message;
 }
 
+void BindPublishLog(sql::PreparedStatement* stmt,
+                    const SnapshotPublishLogRecord& record) {
+    stmt->setInt64(1, record.app_id);
+    stmt->setString(2, record.app_code);
+    stmt->setInt(3, record.policy_version);
+    stmt->setInt64(4, record.snapshot_id);
+    stmt->setString(5, record.published_by);
+    stmt->setString(6, record.publish_result);
+    stmt->setString(7, record.trace_text);
+}
+
 }  // namespace
 
 // ======================================================
@@ -460,6 +471,339 @@ SnapshotBuildResult SnapshotBuilder::BuildAndStoreSnapshot(
     result.snapshot_json = snapshot_json;
 
     return result;
+}
+
+// ======================================================
+// PublishPolicyTransaction
+// 作用：在同一个数据库事务中完成策略版本发布和快照保存
+//
+// 流程：
+// 1. 锁定 app 和策略版本
+// 2. 计算新版本号并更新 ny_policy_versions
+// 3. 基于同一事务读取完整策略数据
+// 4. 写入/覆盖 ny_policy_snapshots
+// 5. 回填 snapshot_id 到 JSON
+// 6. 写 ny_snapshot_publish_logs
+// 7. commit；任何失败 rollback
+// ======================================================
+SnapshotBuildResult SnapshotBuilder::PublishPolicyTransaction(
+    const std::string& app_code,
+    const std::string& published_by,
+    const std::string& publish_note) {
+    SnapshotBuildResult result;
+    setLastError("");
+
+    if (app_code.empty()) {
+        result.status.success = false;
+        result.status.message = "参数不完整：app_code 不能为空";
+        result.status.error_code = "INVALID_ARGUMENT";
+        setLastError("INVALID_ARGUMENT: app_code 不能为空");
+        return result;
+    }
+
+    std::unique_ptr<sql::Connection> conn;
+    int64_t app_id = 0;
+    int new_version = 0;
+
+    try {
+        conn.reset(createConnection());
+        conn->setAutoCommit(false);
+
+        std::unique_ptr<sql::PreparedStatement> app_stmt(
+            conn->prepareStatement(
+                "SELECT a.id, a.app_code, a.status, "
+                "       COALESCE(pv.current_version, 1) AS current_version "
+                "FROM ny_apps a "
+                "LEFT JOIN ny_policy_versions pv ON pv.app_id = a.id "
+                "WHERE a.app_code = ? "
+                "LIMIT 1 "
+                "FOR UPDATE"
+            )
+        );
+        app_stmt->setString(1, app_code);
+        std::unique_ptr<sql::ResultSet> app_rs(app_stmt->executeQuery());
+        if (!app_rs->next()) {
+            throw std::runtime_error("APP_NOT_FOUND: 应用不存在");
+        }
+
+        SnapshotAppInfo app_info;
+        app_info.app_id = app_rs->getInt64("id");
+        app_info.app_code = app_rs->getString("app_code");
+        app_info.enabled = (app_rs->getInt("status") == 1);
+        app_info.policy_version = app_rs->getInt("current_version") + 1;
+
+        if (!app_info.enabled) {
+            throw std::runtime_error("APP_DISABLED: 应用已被禁用");
+        }
+
+        app_id = app_info.app_id;
+        new_version = app_info.policy_version;
+
+        std::unique_ptr<sql::PreparedStatement> version_stmt(
+            conn->prepareStatement(
+                "INSERT INTO ny_policy_versions ("
+                "  app_id, current_version, published_by, publish_note "
+                ") VALUES (?, ?, ?, ?) "
+                "ON DUPLICATE KEY UPDATE "
+                "  current_version = VALUES(current_version), "
+                "  published_by = VALUES(published_by), "
+                "  publish_note = VALUES(publish_note), "
+                "  updated_at = CURRENT_TIMESTAMP"
+            )
+        );
+        version_stmt->setInt64(1, app_id);
+        version_stmt->setInt(2, new_version);
+        version_stmt->setString(3, published_by);
+        version_stmt->setString(4, publish_note);
+        if (version_stmt->executeUpdate() <= 0) {
+            throw std::runtime_error("INTERNAL_ERROR: 更新策略版本失败");
+        }
+
+        PolicySnapshot snapshot;
+        snapshot.app_info = app_info;
+        snapshot.meta = buildSnapshotMeta(published_by, publish_note);
+
+        {
+            std::unique_ptr<sql::PreparedStatement> stmt(
+                conn->prepareStatement(
+                    "SELECT id, role_key, role_name, description, is_default, status "
+                    "FROM ny_roles "
+                    "WHERE app_id = ? "
+                    "ORDER BY id ASC"
+                )
+            );
+            stmt->setInt64(1, app_id);
+            std::unique_ptr<sql::ResultSet> rs(stmt->executeQuery());
+            while (rs->next()) {
+                SnapshotRole role;
+                role.role_id = rs->getInt64("id");
+                role.role_key = rs->getString("role_key");
+                role.role_name = rs->getString("role_name");
+                role.description = rs->getString("description");
+                role.is_default = (rs->getInt("is_default") == 1);
+                role.enabled = (rs->getInt("status") == 1);
+                snapshot.roles.push_back(role);
+            }
+        }
+
+        {
+            std::unique_ptr<sql::PreparedStatement> stmt(
+                conn->prepareStatement(
+                    "SELECT id, perm_key, perm_name, resource_type, "
+                    "       owner_shortcut_enabled, description, status "
+                    "FROM ny_permissions "
+                    "WHERE app_id = ? "
+                    "ORDER BY id ASC"
+                )
+            );
+            stmt->setInt64(1, app_id);
+            std::unique_ptr<sql::ResultSet> rs(stmt->executeQuery());
+            while (rs->next()) {
+                SnapshotPermission perm;
+                perm.permission_id = rs->getInt64("id");
+                perm.perm_key = rs->getString("perm_key");
+                perm.perm_name = rs->getString("perm_name");
+                perm.resource_type = rs->getString("resource_type");
+                perm.owner_shortcut_enabled = (rs->getInt("owner_shortcut_enabled") == 1);
+                perm.description = rs->getString("description");
+                perm.enabled = (rs->getInt("status") == 1);
+                snapshot.permissions.push_back(perm);
+            }
+        }
+
+        {
+            std::unique_ptr<sql::PreparedStatement> stmt(
+                conn->prepareStatement(
+                    "SELECT r.role_key, p.perm_key "
+                    "FROM ny_role_permissions rp "
+                    "JOIN ny_roles r ON r.id = rp.role_id "
+                    "JOIN ny_permissions p ON p.id = rp.perm_id "
+                    "WHERE r.app_id = ? "
+                    "  AND p.app_id = ? "
+                    "ORDER BY r.id ASC, p.id ASC"
+                )
+            );
+            stmt->setInt64(1, app_id);
+            stmt->setInt64(2, app_id);
+            std::unique_ptr<sql::ResultSet> rs(stmt->executeQuery());
+            while (rs->next()) {
+                SnapshotRolePermissionBinding item;
+                item.role_key = rs->getString("role_key");
+                item.perm_key = rs->getString("perm_key");
+                snapshot.role_permission_bindings.push_back(item);
+            }
+        }
+
+        {
+            std::unique_ptr<sql::PreparedStatement> stmt(
+                conn->prepareStatement(
+                    "SELECT ur.app_user_id, r.role_key, ur.granted_by "
+                    "FROM ny_user_roles ur "
+                    "JOIN ny_roles r ON r.id = ur.role_id "
+                    "WHERE ur.app_id = ? "
+                    "ORDER BY ur.id ASC"
+                )
+            );
+            stmt->setInt64(1, app_id);
+            std::unique_ptr<sql::ResultSet> rs(stmt->executeQuery());
+            while (rs->next()) {
+                SnapshotUserRoleBinding item;
+                item.user_id = rs->getString("app_user_id");
+                item.role_key = rs->getString("role_key");
+                item.granted_by = rs->getString("granted_by");
+                snapshot.user_role_bindings.push_back(item);
+            }
+        }
+
+        {
+            std::unique_ptr<sql::PreparedStatement> stmt(
+                conn->prepareStatement(
+                    "SELECT resource_type, resource_id, resource_name, "
+                    "       owner_user_id, metadata_text, status "
+                    "FROM ny_resources "
+                    "WHERE app_id = ? "
+                    "ORDER BY id ASC"
+                )
+            );
+            stmt->setInt64(1, app_id);
+            std::unique_ptr<sql::ResultSet> rs(stmt->executeQuery());
+            while (rs->next()) {
+                SnapshotResourceOwner item;
+                item.resource_type = rs->getString("resource_type");
+                item.resource_id = rs->getString("resource_id");
+                item.resource_name = rs->getString("resource_name");
+                item.owner_user_id = rs->getString("owner_user_id");
+                item.metadata_text = rs->getString("metadata_text");
+                item.enabled = (rs->getInt("status") == 1);
+                snapshot.resource_owners.push_back(item);
+            }
+        }
+
+        std::string snapshot_json = BuildSnapshotJsonText(snapshot);
+
+        std::unique_ptr<sql::PreparedStatement> snapshot_stmt(
+            conn->prepareStatement(
+                "INSERT INTO ny_policy_snapshots ("
+                "  app_id, app_code, policy_version, snapshot_json, status, "
+                "  published_by, publish_note "
+                ") VALUES (?, ?, ?, ?, 1, ?, ?) "
+                "ON DUPLICATE KEY UPDATE "
+                "  snapshot_json = VALUES(snapshot_json), "
+                "  status = VALUES(status), "
+                "  published_by = VALUES(published_by), "
+                "  publish_note = VALUES(publish_note), "
+                "  updated_at = CURRENT_TIMESTAMP"
+            )
+        );
+        snapshot_stmt->setInt64(1, snapshot.app_info.app_id);
+        snapshot_stmt->setString(2, snapshot.app_info.app_code);
+        snapshot_stmt->setInt(3, snapshot.app_info.policy_version);
+        snapshot_stmt->setString(4, snapshot_json);
+        snapshot_stmt->setString(5, snapshot.meta.published_by);
+        snapshot_stmt->setString(6, snapshot.meta.publish_note);
+        if (snapshot_stmt->executeUpdate() <= 0) {
+            throw std::runtime_error("INTERNAL_ERROR: 保存策略快照失败");
+        }
+
+        std::unique_ptr<sql::PreparedStatement> snapshot_id_stmt(
+            conn->prepareStatement(
+                "SELECT id "
+                "FROM ny_policy_snapshots "
+                "WHERE app_id = ? "
+                "  AND policy_version = ? "
+                "LIMIT 1"
+            )
+        );
+        snapshot_id_stmt->setInt64(1, snapshot.app_info.app_id);
+        snapshot_id_stmt->setInt(2, snapshot.app_info.policy_version);
+        std::unique_ptr<sql::ResultSet> snapshot_id_rs(snapshot_id_stmt->executeQuery());
+        if (!snapshot_id_rs->next()) {
+            throw std::runtime_error("INTERNAL_ERROR: 查询策略快照 id 失败");
+        }
+
+        snapshot.meta.snapshot_id = snapshot_id_rs->getInt64("id");
+        snapshot_json = BuildSnapshotJsonText(snapshot);
+
+        std::unique_ptr<sql::PreparedStatement> snapshot_update_stmt(
+            conn->prepareStatement(
+                "UPDATE ny_policy_snapshots "
+                "SET snapshot_json = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE id = ?"
+            )
+        );
+        snapshot_update_stmt->setString(1, snapshot_json);
+        snapshot_update_stmt->setInt64(2, snapshot.meta.snapshot_id);
+        if (snapshot_update_stmt->executeUpdate() <= 0) {
+            throw std::runtime_error("INTERNAL_ERROR: 回填策略快照 id 失败");
+        }
+
+        SnapshotPublishLogRecord success_log;
+        success_log.app_id = snapshot.app_info.app_id;
+        success_log.app_code = snapshot.app_info.app_code;
+        success_log.policy_version = snapshot.app_info.policy_version;
+        success_log.snapshot_id = snapshot.meta.snapshot_id;
+        success_log.published_by = published_by;
+        success_log.publish_result = "SUCCESS";
+        success_log.trace_text = buildSnapshotTraceText(snapshot);
+
+        std::unique_ptr<sql::PreparedStatement> log_stmt(
+            conn->prepareStatement(
+                "INSERT INTO ny_snapshot_publish_logs ("
+                "  app_id, app_code, policy_version, snapshot_id, "
+                "  published_by, publish_result, trace_text "
+                ") VALUES (?, ?, ?, ?, ?, ?, ?)"
+            )
+        );
+        BindPublishLog(log_stmt.get(), success_log);
+        if (log_stmt->executeUpdate() <= 0) {
+            throw std::runtime_error("INTERNAL_ERROR: 写入快照发布日志失败");
+        }
+
+        conn->commit();
+        conn->setAutoCommit(true);
+
+        result.status.success = true;
+        result.status.message = "发布策略并保存快照成功";
+        result.status.error_code = "OK";
+        result.snapshot = snapshot;
+        result.snapshot_id = snapshot.meta.snapshot_id;
+        result.snapshot_json = snapshot_json;
+        return result;
+    } catch (const std::exception& e) {
+        if (conn) {
+            try {
+                conn->rollback();
+                conn->setAutoCommit(true);
+            } catch (...) {
+            }
+        }
+
+        const std::string error_text = e.what();
+        result.status.success = false;
+        result.status.error_code = ExtractErrorCode(error_text);
+        result.status.message = ExtractErrorMessage(error_text);
+        if (result.status.error_code.empty()) {
+            result.status.error_code = "INTERNAL_ERROR";
+        }
+        if (result.status.message.empty()) {
+            result.status.message = "发布策略失败";
+        }
+        setLastError(error_text);
+
+        if (snapshot_dao_) {
+            SnapshotPublishLogRecord failed_log;
+            failed_log.app_id = app_id;
+            failed_log.app_code = app_code;
+            failed_log.policy_version = new_version;
+            failed_log.snapshot_id = 0;
+            failed_log.published_by = published_by;
+            failed_log.publish_result = "FAILED";
+            failed_log.trace_text = error_text.empty() ? "transactional publish failed" : error_text;
+            snapshot_dao_->insertSnapshotPublishLog(failed_log);
+        }
+
+        return result;
+    }
 }
 
 // ======================================================

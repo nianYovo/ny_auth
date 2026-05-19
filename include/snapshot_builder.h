@@ -119,6 +119,11 @@ public:
                                               const std::string& published_by,
                                               const std::string& publish_note);
 
+    // 在同一个数据库事务中发布策略版本并保存快照
+    SnapshotBuildResult PublishPolicyTransaction(const std::string& app_code,
+                                                 const std::string& published_by,
+                                                 const std::string& publish_note);
+
     // 把“原始结构化快照”建立成“索引快照”
     // 用途：
     // - 给 LocalSnapshotEngine 使用

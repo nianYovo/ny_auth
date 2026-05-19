@@ -709,55 +709,59 @@ ManagerPublishPolicyResult AdminManager::PublishPolicy(const ManagerPublishPolic
         return result;
     }
 
-    const int old_version = admin_dao_->getCurrentPolicyVersion(request.app_code);
-
-    const int new_version = admin_dao_->publishPolicy(request.app_code, operator_identity.username, request.publish_note);
-
-    if(new_version <= 0) {
-
-        result.status.success = false;
-        result.status.message = "发布策略失败";
-        result.status.error_code = "INTERNAL_ERROR";
-
-        return result;
-    }
-
     if(snapshot_builder_) {
+        const int old_version = admin_dao_->getCurrentPolicyVersion(request.app_code);
         const SnapshotBuildResult snapshot_result =
-            snapshot_builder_->BuildAndStoreSnapshot(
+            snapshot_builder_->PublishPolicyTransaction(
                 request.app_code,
                 operator_identity.username,
                 request.publish_note
             );
 
         if(!snapshot_result.status.success) {
-            const bool rollback_ok = admin_dao_->setPolicyVersion(
-                request.app_code,
-                old_version,
-                operator_identity.username,
-                "rollback after snapshot failure: " + request.publish_note
-            );
-
             result.status.success = false;
-            result.status.message = rollback_ok
-                ? "构建快照失败，策略版本已回滚：" + snapshot_result.status.message
-                : "构建快照失败，且策略版本回滚失败：" + snapshot_result.status.message;
+            result.status.message = "发布策略失败：" + snapshot_result.status.message;
             result.status.error_code = snapshot_result.status.error_code.empty() ? "INTERNAL_ERROR" : snapshot_result.status.error_code;
-            result.new_policy_version = rollback_ok ? old_version : new_version;
+            result.new_policy_version = old_version;
 
             std::ostringstream before_text;
             before_text << "policy_version = " << old_version;
 
             std::ostringstream after_text;
-            after_text << "policy_version = " << new_version
+            after_text << "policy_version = unchanged"
                        << ", publish_note = " << request.publish_note
-                       << ", snapshot_error = " << snapshot_result.status.message
-                       << ", rollback_ok = " << (rollback_ok ? 1 : 0);
+                       << ", snapshot_error = " << snapshot_result.status.message;
 
-            writeAuditLog(operator_identity, request.app_code, "PUBLISH_POLICY_SNAPSHOT_FAILED", "policy", request.app_code, before_text.str(), after_text.str(), "published policy version but failed to build snapshot");
+            writeAuditLog(operator_identity, request.app_code, "PUBLISH_POLICY_FAILED", "policy", request.app_code, before_text.str(), after_text.str(), "transactional publish failed");
 
             return result;
         }
+
+        result.status.success = true;
+        result.status.message = "发布策略成功";
+        result.status.error_code = "OK";
+        result.new_policy_version = snapshot_result.snapshot.app_info.policy_version;
+
+        std::ostringstream before_text;
+        before_text << "policy_version = " << old_version;
+
+        std::ostringstream after_text;
+        after_text << "policy_version = " << result.new_policy_version
+                   << ", snapshot_id = " << snapshot_result.snapshot_id
+                   << ", publish_note = " << request.publish_note;
+
+        writeAuditLog(operator_identity, request.app_code, "PUBLISH_POLICY", "policy", request.app_code, before_text.str(), after_text.str(), "published new policy version and snapshot transactionally");
+
+        return result;
+    }
+
+    const int old_version = admin_dao_->getCurrentPolicyVersion(request.app_code);
+    const int new_version = admin_dao_->publishPolicy(request.app_code, operator_identity.username, request.publish_note);
+    if(new_version <= 0) {
+        result.status.success = false;
+        result.status.message = "发布策略失败";
+        result.status.error_code = "INTERNAL_ERROR";
+        return result;
     }
 
     result.status.success = true;
@@ -769,9 +773,9 @@ ManagerPublishPolicyResult AdminManager::PublishPolicy(const ManagerPublishPolic
     before_text << "policy_version = " << old_version;
 
     std::ostringstream after_text;
-    after_text << "policy_version = " << new_version << ", publish_note = " <<request.publish_note;
+    after_text << "policy_version = " << new_version << ", publish_note = " << request.publish_note;
 
-    writeAuditLog(operator_identity, request.app_code, "PUBLISH_POLICY", "policy", request.app_code, before_text.str(), after_text.str(), "published new policy version");
+    writeAuditLog(operator_identity, request.app_code, "PUBLISH_POLICY", "policy", request.app_code, before_text.str(), after_text.str(), "published new policy version without snapshot builder");
 
     return result;
 }

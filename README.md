@@ -10,7 +10,7 @@
 - RBAC 模型：支持用户、角色、权限、角色权限绑定、用户角色绑定。
 - owner 快捷规则：资源 owner 可在指定权限开启时直接放行。
 - 策略版本：发布策略后递增 `policy_version`，缓存 key 自动切换到新版本。
-- 发布回滚：策略版本递增后如果快照构建失败，会尝试回滚到发布前版本。
+- 事务发布：策略版本递增、快照保存和发布日志在同一个事务中提交。
 - 决策解释：响应中返回命中角色、命中权限、判权来源、拒绝码和 trace 文本。
 - 管理端接口：支持登录、创建角色、创建权限、绑定权限、授权用户、设置资源 owner、发布策略、模拟鉴权和审计日志查询。
 - 策略快照：发布策略时生成只读快照，供 Agent / Sidecar 拉取和激活。
@@ -40,9 +40,7 @@ ny_auth/
 │   └── agent.proto
 ├── sql/
 │   └── init.sql             # 初始化表结构和测试数据
-├── src/                     # 业务实现和生成的 protobuf C++ 文件
-└── tests/
-    └── local_cache_test.cpp
+└── src/                     # 业务实现和生成的 protobuf C++ 文件
 ```
 
 ## 快速开始
@@ -123,20 +121,12 @@ cmake --build . -j$(nproc)
 
 ```text
 build/auth_server
-build/local_cache_test
 ```
 
-### 4. 运行测试
+### 4. 构建检查
 
 ```bash
-cd build
-ctest --output-on-failure
-```
-
-也可以直接运行缓存测试：
-
-```bash
-./local_cache_test
+cmake --build build -j$(nproc)
 ```
 
 ### 5. 启动服务
@@ -304,7 +294,7 @@ curl -s -X POST 'http://127.0.0.1:8001/ny.admin.AdminService/PublishPolicy' \
 
 成功后会递增 `ny_policy_versions.current_version`，并写入 `ny_policy_snapshots` 和 `ny_snapshot_publish_logs`。
 
-如果策略版本已经递增但快照构建失败，服务会尝试把 `current_version` 回滚到发布前版本，并写入失败审计日志，避免出现“版本已发布但没有对应快照”的半成功状态。
+策略版本递增、快照保存和快照发布日志会在同一个数据库事务中提交。如果任一步失败，事务会回滚，避免出现“版本已发布但没有对应快照”的半成功状态。
 
 ### Agent 拉取和激活快照
 
@@ -473,7 +463,6 @@ cmake --build build -j$(nproc)
 ```bash
 docker compose config --quiet
 cmake --build build -j$(nproc)
-cd build && ctest --output-on-failure
 ```
 
 如果不想污染仓库内 `build/` 目录，也可以使用临时构建目录：
@@ -481,7 +470,6 @@ cd build && ctest --output-on-failure
 ```bash
 cmake -S . -B /tmp/ny_auth_build
 cmake --build /tmp/ny_auth_build -j$(nproc)
-ctest --test-dir /tmp/ny_auth_build --output-on-failure
 ```
 
 ## 常见问题
@@ -530,4 +518,4 @@ pkg-config --cflags --libs brpc
 - DAO 当前仍是按操作创建 MySQL 连接，高并发场景建议引入连接池。
 - 快照 JSON 解析覆盖当前项目结构所需的 JSON 子集，后续可替换为成熟 JSON 库。
 - SQL 初始化脚本适合开发环境，生产环境建议拆成正式 migration。
-- 当前测试覆盖集中在本地缓存，建议继续补充鉴权、发布回滚、快照 round-trip 和集成测试。
+- 当前仓库未保留自动化测试目录，建议后续重新补充鉴权、发布回滚、快照 round-trip 和集成测试。

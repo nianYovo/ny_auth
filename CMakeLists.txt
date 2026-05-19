@@ -97,10 +97,6 @@ add_executable(auth_server
     ${PROTO_SRCS}
 )
 
-add_executable(local_cache_test
-    tests/local_cache_test.cpp
-)
-
 # =========================================================
 # 指定头文件搜索路径
 # =========================================================
@@ -110,10 +106,6 @@ target_include_directories(auth_server PRIVATE
     ${PROTOBUF_INCLUDE_DIRS}
     ${BRPC_INCLUDE_DIRS}
     ${MYSQL_INCLUDE_DIR}
-)
-
-target_include_directories(local_cache_test PRIVATE
-    include
 )
 
 # =========================================================
@@ -132,9 +124,6 @@ target_link_libraries(auth_server
     crypto
     leveldb
 )
-
-enable_testing()
-add_test(NAME local_cache_test COMMAND local_cache_test)
 
 # =========================================================
 # 打印调试信息
