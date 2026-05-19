@@ -179,6 +179,65 @@ Agent / Sidecar 可以：
 > 说明：本 README 使用 GitHub 原生支持的 Mermaid 绘制架构图。
 > 在 GitHub 仓库页面中，`mermaid` 代码块会自动渲染为图像；在部分 Markdown 编辑器、聊天窗口或普通文本预览中，可能只会显示为代码块。
 
+### 整体架构
+
+`ny_auth` 当前以单进程服务承载三个接口面：中心鉴权、管理端、Agent / Sidecar。三类接口共享同一套策略数据和快照数据，但面向不同调用方：
+
+- `AuthService` 面向业务系统，负责在线鉴权。
+- `AdminService` 面向管理端，负责策略维护、模拟鉴权、发布策略和审计查询。
+- `AgentService` 面向 Agent / Sidecar，负责快照拉取、快照激活和本地判权。
+
+服务内部按职责拆成几层：
+
+| 层次 | 代表模块 | 职责 |
+|---|---|---|
+| RPC 接入层 | `AuthServiceImpl`、`AdminServiceImpl`、`AgentServiceImpl` | 接收 brpc / HTTP JSON 请求，完成 protobuf 与内部结构转换 |
+| 业务编排层 | `DecisionEngine`、`AdminManager`、`SimulationEngine`、`LocalSnapshotEngine` | 执行鉴权、管理操作、模拟检查和本地快照判权 |
+| 快照层 | `SnapshotBuilder`、`SnapshotDAO` | 构建、保存、读取和索引策略快照 |
+| 数据访问层 | `PermissionDAO`、`AdminDAO`、`SnapshotDAO` | 访问 MySQL 中的应用、角色、权限、资源、日志和快照表 |
+| 缓存层 | `LocalCache` | 缓存用户权限集合和管理员 session |
+| 存储层 | MySQL | 保存策略源数据、策略版本、决策日志、审计日志和策略快照 |
+
+整体关系如下：
+
+```mermaid
+flowchart TB
+    Biz[业务系统] --> Auth[AuthService]
+    Console[管理端/运维人员] --> Admin[AdminService]
+    Sidecar[Agent / Sidecar] --> Agent[AgentService]
+
+    Auth --> AuthImpl[AuthServiceImpl]
+    Admin --> AdminImpl[AdminServiceImpl]
+    Agent --> AgentImpl[AgentServiceImpl]
+
+    AuthImpl --> Decision[DecisionEngine]
+    AdminImpl --> Manager[AdminManager]
+    Manager --> Sim[SimulationEngine]
+    Manager --> Builder[SnapshotBuilder]
+    AgentImpl --> SnapshotDao[SnapshotDAO]
+    AgentImpl --> LocalEngine[LocalSnapshotEngine]
+
+    Decision --> PermDao[PermissionDAO]
+    Decision --> RuntimeCache[LocalCache: 权限缓存]
+    Manager --> AdminDao[AdminDAO]
+    Manager --> SessionCache[LocalCache: session 缓存]
+    Builder --> SnapshotDao
+
+    PermDao --> DB[(MySQL)]
+    AdminDao --> DB
+    SnapshotDao --> DB
+    RuntimeCache -. policy_version 切换 .-> Decision
+    Builder --> SnapshotTable[策略快照]
+    SnapshotTable --> DB
+    AgentImpl --> LocalEngine
+```
+
+核心数据流分三条：
+
+1. **在线鉴权链路**：业务系统调用 `AuthService.Check`，服务读取应用、权限、资源和用户角色数据，优先尝试 owner shortcut，再通过 RBAC 判断，并写入决策日志。
+2. **策略管理链路**：管理员通过 `AdminService` 创建角色、权限和绑定关系；这些修改先落到策略源数据表，调用 `PublishPolicy` 后才递增策略版本并生成快照。
+3. **本地判权链路**：Agent 通过 `AgentService` 拉取并激活策略快照，之后 `LocalSnapshotEngine` 基于内存索引完成本地判权，降低中心服务访问压力。
+
 ### 判权流程
 
 ```mermaid
